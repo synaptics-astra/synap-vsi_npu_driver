@@ -9,7 +9,7 @@
 /**
   *  UUID of the TA
   */
-#define SYNAP_TA_UUID {0x1316a183, 0x894d, 0x43fe, {0x98, 0x93, 0xbb, 0x94, 0x6a, 0xe1, 0x04, 0x2F}}
+#define SYNAP_TA_UUID {0x1316a183, 0x894d, 0x43fe, {0x98, 0x93, 0xbb, 0x94, 0x6a, 0xe1, 0x04, 0x2f}}
 
 #define SYNAP_TA_DRIVER_BUFFER_SIZE 32768
 #define SYNAP_TA_DRIVER_BUFFER_ALIGNEMENT 4096
@@ -115,6 +115,7 @@ enum {
       *  PARAM 0 : TEEC_MEMREF_TEMP_INPUT array of struct synap_ta_memory_area, the corresponding
       *            buffer will be in use until SYNAP_TA_CMD_DESTROY_IO_BUFFER is called
       *  PARAM 1 : TEEC_VALUE_INPUT a = 0 : buffer must be used as non-secure buffer, 1: secure
+      *                             b = number of areas sent in PARAM 0
       *  PARAM 2 : TEEC_VALUE_OUTPUT a = bid, b = mem_id (if sg is in system memory)
       *
       */

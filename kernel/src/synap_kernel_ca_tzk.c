@@ -2,10 +2,18 @@
 /* Copyright (C) 2021 Synaptics Incorporated */
 
 #include <linux/string.h>
+#include <linux/slab.h>
 
 #include "synap_kernel_ca.h"
 #include "synap_kernel_log.h"
+#include <tee_client_api.h>
 #include "tee_client_const.h"
+#include <ca/synap_ta_cmd.h>
+
+struct synap_ca {
+    TEEC_Context teec_context;
+    TEEC_Session teec_session;
+};
 
 static const char *synap_ta_log_code_to_str(TEEC_Result code) {
     switch (code) {
@@ -32,8 +40,56 @@ static const char *synap_ta_log_code_to_str(TEEC_Result code) {
 }
 
 
-TEEC_Result synap_ca_create_session(TEEC_Context *context,
-                                    TEEC_Session *session,
+bool synap_ca_create(struct synap_ca **synap_ca) {
+    *synap_ca = (struct synap_ca *) kzalloc(sizeof(struct synap_ca), GFP_KERNEL);
+
+    if (!*synap_ca) {
+        KLOGE("cannot allocate memory for synap_ca");
+        return false;
+    }
+
+    return TEEC_InitializeContext(NULL, &((*synap_ca)->teec_context)) == TEEC_SUCCESS;
+}
+
+bool synap_ca_load_ta(struct synap_ca *synap_ca, void *ta_data, size_t ta_size) {
+
+    TEEC_Result ret = TEEC_SUCCESS;
+    TEEC_SharedMemory teeShm;
+    TEEC_Parameter parameter;
+
+    teeShm.size = ta_size;
+    teeShm.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT;
+
+    ret = TEEC_AllocateSharedMemory(&synap_ca->teec_context, &teeShm);
+
+    if (ret != TEEC_SUCCESS || (NULL == teeShm.buffer)) {
+        KLOGE("alloc teeshm failed ret=0x%x", ret);
+        return false;
+    }
+
+    memcpy(teeShm.buffer, ta_data, teeShm.size);
+
+    parameter.memref.parent = &teeShm;
+    parameter.memref.size = teeShm.size;
+    parameter.memref.offset = 0;
+
+    ret = TEEC_RegisterTA(&synap_ca->teec_context, &parameter, TEEC_MEMREF_PARTIAL_INPUT);
+
+    if (TEEC_SUCCESS == ret) {
+        KLOGH("SyNAP TA loaded successfully");
+    } else if (TEEC_ERROR_ACCESS_CONFLICT == ret) {
+        KLOGE("SyNAP TA has been registered");
+        ret = TEEC_SUCCESS;
+    } else {
+        KLOGE("SyNAP TA loading failed, ret=0x%x", ret);
+    }
+
+    TEEC_ReleaseSharedMemory(&teeShm);
+
+    return ret == TEEC_SUCCESS;
+}
+
+bool synap_ca_create_session(struct synap_ca *synap_ca,
                                     struct sg_table *secure_buf,
                                     struct sg_table *non_secure_buf)
 {
@@ -50,15 +106,15 @@ TEEC_Result synap_ca_create_session(TEEC_Context *context,
 
     if (secure_buf->nents != 1 || non_secure_buf->nents != 1) {
         KLOGE("only contiguous driver buffers are supported");
-        return TEEC_ERROR_BAD_PARAMETERS;
+        return false;
     }
 
     shm.size = 2 * sizeof(struct synap_ta_memory_area);
     shm.flags = TEEC_MEM_INPUT;
 
-    if ((result = TEEC_AllocateSharedMemory(context, &shm)) != TEEC_SUCCESS) {
+    if ((result = TEEC_AllocateSharedMemory(&synap_ca->teec_context, &shm)) != TEEC_SUCCESS) {
         KLOGE("cannot allocate shared memory");
-        return result;
+        return false;
     }
 
     areas = (struct synap_ta_memory_area *) shm.buffer;
@@ -78,7 +134,7 @@ TEEC_Result synap_ca_create_session(TEEC_Context *context,
     operation.params[0].memref.size = shm.size;
     operation.params[0].memref.offset = 0;
 
-    result = TEEC_OpenSession(context, session, &uuid, TEEC_LOGIN_USER, NULL,
+    result = TEEC_OpenSession(&synap_ca->teec_context, &synap_ca->teec_session, &uuid, TEEC_LOGIN_USER, NULL,
                            &operation, (uint32_t *) NULL);
 
     if (result != TEEC_SUCCESS) {
@@ -87,10 +143,10 @@ TEEC_Result synap_ca_create_session(TEEC_Context *context,
 
     TEEC_ReleaseSharedMemory(&shm);
 
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
-TEEC_Result synap_ca_activate_npu(TEEC_Session *session, u8 mode)
+bool synap_ca_activate_npu(struct synap_ca *synap_ca, u8 mode)
 {
     TEEC_Operation operation;
     TEEC_Result result;
@@ -101,16 +157,16 @@ TEEC_Result synap_ca_activate_npu(TEEC_Session *session, u8 mode)
     operation.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE, TEEC_NONE, TEEC_NONE);
     operation.params[0].value.a = mode > 0 ? 1 : 0;
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_ACTIVATE_NPU, &operation, NULL);
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_ACTIVATE_NPU, &operation, NULL);
     if (result != TEEC_SUCCESS) {
         KLOGE("Error=0x%08x (%s)", result, synap_ta_log_code_to_str(result));
     }
 
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
 
-TEEC_Result synap_ca_deactivate_npu(TEEC_Session *session)
+bool synap_ca_deactivate_npu(struct synap_ca *synap_ca)
 {
     TEEC_Operation operation;
     TEEC_Result result;
@@ -120,17 +176,17 @@ TEEC_Result synap_ca_deactivate_npu(TEEC_Session *session)
 
     operation.paramTypes = TEEC_PARAM_TYPES(TEEC_NONE, TEEC_NONE, TEEC_NONE, TEEC_NONE);
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_DEACTIVATE_NPU, &operation, NULL);
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_DEACTIVATE_NPU, &operation, NULL);
     if (result != TEEC_SUCCESS) {
         KLOGE("Error=0x%08x (%s)", result, synap_ta_log_code_to_str(result));
     }
 
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
 
 
-TEEC_Result synap_ca_set_input(TEEC_Session *session, u32 nid, u32 aid, u32 index)
+bool synap_ca_set_input(struct synap_ca *synap_ca, u32 nid, u32 aid, u32 index)
 {
     TEEC_Operation operation;
     TEEC_Result result;
@@ -144,15 +200,15 @@ TEEC_Result synap_ca_set_input(TEEC_Session *session, u32 nid, u32 aid, u32 inde
     operation.params[0].value.b = aid;
     operation.params[1].value.a = index;
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_SET_INPUT, &operation, NULL);
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_SET_INPUT, &operation, NULL);
     if (result != TEEC_SUCCESS) {
         KLOGE("Error=0x%08x (%s)", result, synap_ta_log_code_to_str(result));
     }
 
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
-TEEC_Result synap_ca_set_output(TEEC_Session *session, u32 nid, u32 aid, u32 index)
+bool synap_ca_set_output(struct synap_ca *synap_ca, u32 nid, u32 aid, u32 index)
 {
     TEEC_Operation operation;
     TEEC_Result result;
@@ -166,12 +222,12 @@ TEEC_Result synap_ca_set_output(TEEC_Session *session, u32 nid, u32 aid, u32 ind
     operation.params[0].value.b = aid;
     operation.params[1].value.a = index;
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_SET_OUTPUT, &operation, NULL);
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_SET_OUTPUT, &operation, NULL);
     if (result != TEEC_SUCCESS) {
         KLOGE("Error=0x%08x (%s)", result, synap_ta_log_code_to_str(result));
     }
 
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
 static void synap_ca_copy_to_memory_areas(struct synap_ta_memory_area *areas,
@@ -188,7 +244,7 @@ static void synap_ca_copy_to_memory_areas(struct synap_ta_memory_area *areas,
     }
 }
 
-static TEEC_Result synap_ca_wrap_user_buffer(TEEC_Session *session, struct sg_table *ub_sg,
+static TEEC_Result synap_ca_wrap_user_buffer(struct synap_ca *synap_ca, struct sg_table *ub_sg,
                                              u32 ub_offset, u32 ub_size,
                                              TEEC_SharedMemory *shm,
                                              struct synap_ta_user_buffer **ub) {
@@ -203,9 +259,9 @@ static TEEC_Result synap_ca_wrap_user_buffer(TEEC_Session *session, struct sg_ta
 
     shm->flags = TEEC_MEM_INPUT;
 
-    if ((result = TEEC_AllocateSharedMemory(session->device, shm)) != TEEC_SUCCESS) {
+    if ((result = TEEC_AllocateSharedMemory(synap_ca->teec_session.device, shm)) != TEEC_SUCCESS) {
         KLOGE("cannot allocate shared memory");
-        return result;
+        return false;
     }
 
     res = shm->buffer;
@@ -219,11 +275,11 @@ static TEEC_Result synap_ca_wrap_user_buffer(TEEC_Session *session, struct sg_ta
 
     *ub = res;
 
-    return TEEC_SUCCESS;
+    return true;
 }
 
 static TEEC_Result synap_ca_create_network_resources(
-        TEEC_Session *session, struct sg_table *code,
+        struct synap_ca *synap_ca, struct sg_table *code,
         struct sg_table *page_table, struct sg_table *pool, struct sg_table *profile_data,
         TEEC_SharedMemory *shm, struct synap_ta_network_resources **resources) {
 
@@ -248,9 +304,9 @@ static TEEC_Result synap_ca_create_network_resources(
 
     shm->flags = TEEC_MEM_INPUT;
 
-    if ((result = TEEC_AllocateSharedMemory(session->device, shm)) != TEEC_SUCCESS) {
+    if ((result = TEEC_AllocateSharedMemory(synap_ca->teec_session.device, shm)) != TEEC_SUCCESS) {
         KLOGE("cannot allocate shared memory");
-        return result;
+        return false;
     }
 
     res = shm->buffer;
@@ -290,10 +346,10 @@ static TEEC_Result synap_ca_create_network_resources(
 
     *resources = res;
 
-    return TEEC_SUCCESS;
+    return true;
 }
 
-TEEC_Result synap_ca_create_network(TEEC_Session *session,
+bool synap_ca_create_network(struct synap_ca *synap_ca,
                                     struct sg_table *header,
                                     u32 header_offset, u32 header_size,
                                     struct sg_table *payload,
@@ -317,22 +373,22 @@ TEEC_Result synap_ca_create_network(TEEC_Session *session,
 
     memset(&operation, 0, sizeof(TEEC_Operation));
 
-    if ((result = synap_ca_create_network_resources(session, code, page_table, pool, profile_data,
-                                          &resources_shm, &res)) != TEEC_SUCCESS) {
-        return result;
+    if (!synap_ca_create_network_resources(synap_ca, code, page_table, pool, profile_data,
+                                           &resources_shm, &res)) {
+        return false;
     }
 
-    if ((result = synap_ca_wrap_user_buffer(session, header, header_offset, header_size,
-                                  &header_shm, &header_ub)) != TEEC_SUCCESS) {
+    if (!synap_ca_wrap_user_buffer(synap_ca, header, header_offset, header_size,
+                                   &header_shm, &header_ub)) {
         TEEC_ReleaseSharedMemory(&resources_shm);
-        return result;
+        return false;
     }
 
-    if ((result = synap_ca_wrap_user_buffer(session, payload, payload_offset, payload_size,
-                                  &payload_shm, &payload_ub)) != TEEC_SUCCESS) {
+    if (!synap_ca_wrap_user_buffer(synap_ca, payload, payload_offset, payload_size,
+                                   &payload_shm, &payload_ub)) {
         TEEC_ReleaseSharedMemory(&resources_shm);
         TEEC_ReleaseSharedMemory(&header_shm);
-        return result;
+        return false;
     }
 
     operation.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_PARTIAL_INPUT, TEEC_MEMREF_PARTIAL_INPUT,
@@ -347,7 +403,7 @@ TEEC_Result synap_ca_create_network(TEEC_Session *session,
     operation.params[2].memref.parent = &resources_shm;
     operation.params[2].memref.size =  resources_shm.size;
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_CREATE_NETWORK, &operation,
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_CREATE_NETWORK, &operation,
                                 (uint32_t *) NULL);
 
     if (result != TEEC_SUCCESS) {
@@ -370,10 +426,10 @@ TEEC_Result synap_ca_create_network(TEEC_Session *session,
     TEEC_ReleaseSharedMemory(&payload_shm);
 
     *nid = operation.params[3].value.a;
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
-TEEC_Result synap_ca_destroy_network(TEEC_Session *session, u32 nid)
+bool synap_ca_destroy_network(struct synap_ca *synap_ca, u32 nid)
 {
     TEEC_Operation operation;
     TEEC_Result result;
@@ -384,14 +440,14 @@ TEEC_Result synap_ca_destroy_network(TEEC_Session *session, u32 nid)
     operation.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE, TEEC_NONE, TEEC_NONE);
     operation.params[0].value.a = nid;
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_DESTROY_NETWORK, &operation, NULL);
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_DESTROY_NETWORK, &operation, NULL);
     if (result != TEEC_SUCCESS) {
         KLOGE("Error=0x%08x (%s)", result, synap_ta_log_code_to_str(result));
     }
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
-TEEC_Result synap_ca_start_network(TEEC_Session *session, u32 nid)
+bool synap_ca_start_network(struct synap_ca *synap_ca, u32 nid)
 {
     TEEC_Operation operation;
     TEEC_Result result;
@@ -402,16 +458,17 @@ TEEC_Result synap_ca_start_network(TEEC_Session *session, u32 nid)
     operation.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE, TEEC_NONE, TEEC_NONE);
     operation.params[0].value.a = nid;
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_START_NETWORK, &operation, NULL);
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_START_NETWORK, &operation, NULL);
     if (result != TEEC_SUCCESS) {
         // BAD_FORMAT here normally means that the network has been compiled for an incompatible HW
         KLOGE("Error=0x%08x (%s)", result, synap_ta_log_code_to_str(result));
     }
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
-static TEEC_Result synap_ca_create_areas(TEEC_Session *session,
+static TEEC_Result synap_ca_create_areas(struct synap_ca *synap_ca,
                                         struct sg_table *buf, u32 offset, u32 size,
+                                        size_t *count,
                                         TEEC_SharedMemory *shm) {
 
     struct scatterlist *sg = NULL;
@@ -429,7 +486,7 @@ static TEEC_Result synap_ca_create_areas(TEEC_Session *session,
 
     if (offset % PAGE_SIZE != 0) {
         KLOGE("offset is not a multiple of PAGE_SIZE");
-        return TEEC_ERROR_BAD_PARAMETERS;
+        return false;
     }
 
     mem_start = offset;
@@ -437,7 +494,7 @@ static TEEC_Result synap_ca_create_areas(TEEC_Session *session,
 
     if (buf->nents == 0) {
         KLOGE("sg list has no entries");
-        return TEEC_ERROR_BAD_PARAMETERS;
+        return false;
     }
 
     // Count the number of segments that fall (completely or partially)
@@ -454,9 +511,9 @@ static TEEC_Result synap_ca_create_areas(TEEC_Session *session,
     shm->size = areas_count * sizeof(struct synap_ta_memory_area);
     shm->flags = TEEC_MEM_INPUT;
 
-    if (TEEC_AllocateSharedMemory(session->device, shm) != TEEC_SUCCESS) {
+    if (TEEC_AllocateSharedMemory(synap_ca->teec_session.device, shm) != TEEC_SUCCESS) {
         KLOGE("cannot allocate shared memory");
-        return TEEC_ERROR_OUT_OF_MEMORY;
+        return false;
     }
 
     areas = (struct synap_ta_memory_area *) shm->buffer;
@@ -498,12 +555,14 @@ static TEEC_Result synap_ca_create_areas(TEEC_Session *session,
 
     }
 
-    return TEEC_SUCCESS;
+    *count = areas_count;
+
+    return true;
 
 }
 
 
-TEEC_Result synap_ca_create_io_buffer_from_mem_id(TEEC_Session *session, u32 mem_id,
+bool synap_ca_create_io_buffer_from_mem_id(struct synap_ca *synap_ca, u32 mem_id,
                                                   u32 offset, u32 size, u32 *bid) {
     TEEC_Operation operation;
     TEEC_Result result;
@@ -520,7 +579,7 @@ TEEC_Result synap_ca_create_io_buffer_from_mem_id(TEEC_Session *session, u32 mem
     operation.params[1].value.a = offset;
     operation.params[1].value.b = size;
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_CREATE_IO_BUFFER_FROM_MEM_ID,
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_CREATE_IO_BUFFER_FROM_MEM_ID,
                                 &operation, (uint32_t *) NULL);
 
     *bid = operation.params[2].value.a;
@@ -528,11 +587,11 @@ TEEC_Result synap_ca_create_io_buffer_from_mem_id(TEEC_Session *session, u32 mem
     if (result != TEEC_SUCCESS) {
         KLOGE("Error=0x%08x (%s)", result, synap_ta_log_code_to_str(result));
     }
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
 
-TEEC_Result synap_ca_create_io_buffer_from_sg(TEEC_Session *session, struct sg_table *buf,
+bool synap_ca_create_io_buffer_from_sg(struct synap_ca *synap_ca, struct sg_table *buf,
                                               u32 offset, u32 size, bool secure, u32 *bid,
                                               u32 *mem_id) {
     TEEC_SharedMemory shm;
@@ -540,12 +599,14 @@ TEEC_Result synap_ca_create_io_buffer_from_sg(TEEC_Session *session, struct sg_t
 
     TEEC_Operation operation;
 
+    size_t areas_count;
+
     LOG_ENTER();
 
     memset(&operation, 0, sizeof(TEEC_Operation));
 
-    if ((result = synap_ca_create_areas(session, buf, offset, size, &shm)) != TEEC_SUCCESS) {
-        return result;
+    if (!synap_ca_create_areas(synap_ca, buf, offset, size, &areas_count, &shm)) {
+        return false;
     }
 
     operation.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_PARTIAL_INPUT, TEEC_VALUE_INPUT,
@@ -554,8 +615,9 @@ TEEC_Result synap_ca_create_io_buffer_from_sg(TEEC_Session *session, struct sg_t
     operation.params[0].memref.size = shm.size;
 
     operation.params[1].value.a = secure ? 1 : 0;
+    operation.params[1].value.b = areas_count;
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_CREATE_IO_BUFFER_FROM_SG,
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_CREATE_IO_BUFFER_FROM_SG,
                              &operation, (uint32_t *) NULL);
 
     if (result != TEEC_SUCCESS) {
@@ -569,10 +631,10 @@ TEEC_Result synap_ca_create_io_buffer_from_sg(TEEC_Session *session, struct sg_t
         *mem_id = operation.params[2].value.b;
     }
 
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
-TEEC_Result synap_ca_attach_io_buffer(TEEC_Session *session, u32 nid,
+bool synap_ca_attach_io_buffer(struct synap_ca *synap_ca, u32 nid,
                                       u32 bid, u32 *aid) {
     TEEC_Operation operation;
     TEEC_Result result;
@@ -586,19 +648,19 @@ TEEC_Result synap_ca_attach_io_buffer(TEEC_Session *session, u32 nid,
     operation.params[0].value.a = bid;
     operation.params[0].value.b = nid;
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_ATTACH_IO_BUFFER,
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_ATTACH_IO_BUFFER,
                                 &operation, (uint32_t *) NULL);
     *aid = operation.params[1].value.a;
 
     if (result != TEEC_SUCCESS) {
         KLOGE("Error=0x%08x (%s)", result, synap_ta_log_code_to_str(result));
     }
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
 
 
-TEEC_Result synap_ca_detach_io_buffer(TEEC_Session *session, u32 nid, u32 aid)
+bool synap_ca_detach_io_buffer(struct synap_ca *synap_ca, u32 nid, u32 aid)
 {
     TEEC_Operation operation;
     TEEC_Result result;
@@ -610,15 +672,15 @@ TEEC_Result synap_ca_detach_io_buffer(TEEC_Session *session, u32 nid, u32 aid)
     operation.params[0].value.a = nid;
     operation.params[0].value.b = aid;
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_DETACH_IO_BUFFER, &operation, NULL);
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_DETACH_IO_BUFFER, &operation, NULL);
     if (result != TEEC_SUCCESS) {
         KLOGE("Error=0x%08x (%s)", result, synap_ta_log_code_to_str(result));
     }
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
 
-TEEC_Result synap_ca_destroy_io_buffer(TEEC_Session *session, u32 bid)
+bool synap_ca_destroy_io_buffer(struct synap_ca *synap_ca, u32 bid)
 {
     TEEC_Operation operation;
     TEEC_Result result;
@@ -629,15 +691,15 @@ TEEC_Result synap_ca_destroy_io_buffer(TEEC_Session *session, u32 bid)
     operation.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_INPUT, TEEC_NONE, TEEC_NONE, TEEC_NONE);
     operation.params[0].value.a = bid;
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_DESTROY_IO_BUFFER, &operation, NULL);
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_DESTROY_IO_BUFFER, &operation, NULL);
     if (result != TEEC_SUCCESS) {
         KLOGE("Error=0x%08x (%s)", result, synap_ta_log_code_to_str(result));
     }
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
 
-TEEC_Result synap_ca_read_interrupt_register(TEEC_Session *session, volatile u32 *reg_value)
+bool synap_ca_read_interrupt_register(struct synap_ca *synap_ca, volatile u32 *reg_value)
 {
     TEEC_Operation operation;
     TEEC_Result result;
@@ -648,16 +710,20 @@ TEEC_Result synap_ca_read_interrupt_register(TEEC_Session *session, volatile u32
 
     operation.paramTypes = TEEC_PARAM_TYPES(TEEC_VALUE_OUTPUT, TEEC_NONE, TEEC_NONE, TEEC_NONE);
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_READ_INTERRUPT_REGISTER, &operation, NULL);
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_READ_INTERRUPT_REGISTER, &operation, NULL);
     *reg_value = operation.params[0].value.a;
 
-    if (result != TEEC_SUCCESS) {
-        KLOGE("Error=0x%08x (%s)", result, synap_ta_log_code_to_str(result));
+    // TEEC_ERROR_BAD_STATE may be raised if the execution was aborted
+    if (result == TEEC_ERROR_BAD_STATE) {
+        KLOGI("Info=0x%08x (%s) while reading npu status register", result, synap_ta_log_code_to_str(result));
+    } else if (result != TEEC_SUCCESS) {
+        KLOGE("Error=0x%08x (%s) while reading npu status register", result, synap_ta_log_code_to_str(result));
     }
-    return result;
+
+    return result == TEEC_SUCCESS;
 }
 
-TEEC_Result synap_ca_dump_state(TEEC_Session *session) {
+bool synap_ca_dump_state(struct synap_ca *synap_ca) {
     TEEC_Operation operation;
     TEEC_Result result;
 
@@ -667,20 +733,26 @@ TEEC_Result synap_ca_dump_state(TEEC_Session *session) {
 
     operation.paramTypes = TEEC_PARAM_TYPES(TEEC_NONE, TEEC_NONE, TEEC_NONE, TEEC_NONE);
 
-    result = TEEC_InvokeCommand(session, SYNAP_TA_CMD_DUMP_STATE, &operation, NULL);
+    result = TEEC_InvokeCommand(&synap_ca->teec_session, SYNAP_TA_CMD_DUMP_STATE, &operation, NULL);
 
     if (result != TEEC_SUCCESS) {
         KLOGE("Error=0x%08x (%s)", result, synap_ta_log_code_to_str(result));
     }
-    return result;
+    return result == TEEC_SUCCESS;
 }
 
 
-TEEC_Result synap_ca_destroy_session(TEEC_Session *session)
+bool synap_ca_destroy_session(struct synap_ca *synap_ca)
 {
     LOG_ENTER();
 
-    TEEC_CloseSession(session);
-    return TEEC_SUCCESS;
+    TEEC_CloseSession(&synap_ca->teec_session);
+
+    return true;
 }
 
+
+void synap_ca_destroy(struct synap_ca* synap_ca) {
+    TEEC_FinalizeContext(&synap_ca->teec_context);
+    kfree(synap_ca);
+}

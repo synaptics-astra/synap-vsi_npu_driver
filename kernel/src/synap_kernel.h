@@ -5,7 +5,6 @@
 
 #include <linux/types.h>
 #include <linux/cdev.h>
-#include <tee_client_api.h>
 #include <linux/miscdevice.h>
 #include <linux/platform_device.h>
 
@@ -20,8 +19,7 @@
 
 
 struct synap_ta {
-    TEEC_Context teec_context;
-    TEEC_Session teec_session;
+    struct synap_ca *ca;
 
     /* buffers used by the TA to store initialization sequences */
     struct synap_mem *nonsecure_buf;

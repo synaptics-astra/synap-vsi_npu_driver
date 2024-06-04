@@ -271,11 +271,10 @@ static struct synap_network* synap_alloc_network(struct synap_file *inst,
     return net;
 }
 
+#ifndef CONFIG_OPTEE
 static bool synap_load_ta(struct synap_ta *ta)
 {
-    TEEC_Result ret = TEEC_SUCCESS;
-    TEEC_SharedMemory teeShm;
-    TEEC_Parameter parameter;
+    bool ret;
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0)
     loff_t size = 0;
@@ -310,38 +309,13 @@ static bool synap_load_ta(struct synap_ta *ta)
 
     KLOGI("libsyapta size=%d", size);
 
-    teeShm.size = size;
-    teeShm.flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT;
-    ret = TEEC_AllocateSharedMemory(
-                   &ta->teec_context,
-                   &teeShm);
-    if (ret != TEEC_SUCCESS || (NULL == teeShm.buffer)) {
-        KLOGE("alloc teeshm failed ret=0x%x", ret);
-        return false;
-    }
-
-    memcpy(teeShm.buffer, ta_data, teeShm.size);
+    ret = synap_ca_load_ta(ta->ca, ta_data, size);
 
     vfree(ta_data);
-
-    parameter.memref.parent = &teeShm;
-    parameter.memref.size = teeShm.size;
-    parameter.memref.offset = 0;
-
-    ret = TEEC_RegisterTA(&ta->teec_context, &parameter, TEEC_MEMREF_PARTIAL_INPUT);
-    if (TEEC_SUCCESS == ret) {
-        KLOGH("SyNAP TA loaded successfully");
-    } else if (TEEC_ERROR_ACCESS_CONFLICT == ret) {
-        KLOGE("SyNAP TA has been registered");
-        ret = TEEC_SUCCESS;
-    } else {
-        KLOGE("SyNAP TA loading failed, ret=0x%x", ret);
-    }
-
-    TEEC_ReleaseSharedMemory(&teeShm);
-
-    return true;
+    
+    return ret;
 }
+#endif
 
 static bool synap_connect_ta(struct synap_ta* ta)
 {
@@ -360,9 +334,7 @@ static bool synap_connect_ta(struct synap_ta* ta)
         return false;
     }
 
-    if (synap_ca_create_session(&ta->teec_context, &ta->teec_session,
-                                ta->secure_buf->sg_table,
-                                ta->nonsecure_buf->sg_table) != TEEC_SUCCESS) {
+    if (!synap_ca_create_session(ta->ca, ta->secure_buf->sg_table, ta->nonsecure_buf->sg_table)) {
         KLOGE("TEE create session failed");
         return false;
     }
@@ -380,18 +352,18 @@ static void synap_finalize_ta(struct synap_ta *ta)
 
     KLOGI("finalize TA");
 
-    if (synap_ca_deactivate_npu(&ta->teec_session) != TEEC_SUCCESS) {
+    if (!synap_ca_deactivate_npu(ta->ca)) {
         KLOGE("TEE npu deactivation failed.");
     }
 
-    if (synap_ca_destroy_session(&ta->teec_session) != TEEC_SUCCESS) {
+    if (!synap_ca_destroy_session(ta->ca)) {
         KLOGE("TEE destroy session failed.");
     }
 
     if (ta->secure_buf) synap_mem_free(ta->secure_buf);
     if (ta->nonsecure_buf) synap_mem_free(ta->nonsecure_buf);
 
-    TEEC_FinalizeContext(&ta->teec_context);
+    synap_ca_destroy(ta->ca);
 
     kfree(ta);
 
@@ -413,15 +385,17 @@ static struct synap_ta * synap_init_ta(struct synap_device *dev)
         return NULL;
     }
 
-    if (TEEC_InitializeContext(NULL, &ta->teec_context) != TEEC_SUCCESS) {
+    if (!synap_ca_create(&ta->ca)) {
         KLOGE("TEE initialize failed");
         return NULL;
     }
 
+#ifndef CONFIG_OPTEE
     if (!synap_load_ta(ta)) {
         synap_finalize_ta(ta);
         return NULL;
     }
+#endif
 
     ta->nonsecure_buf = synap_mem_alloc(dev, SYNAP_MEM_DRIVER_BUFFER,
                                         false, SYNAP_TA_DRIVER_BUFFER_SIZE);
@@ -454,7 +428,7 @@ static struct synap_ta * synap_init_ta(struct synap_device *dev)
 static irqreturn_t synap_irq_handler(int irq, void *data)
 {
 
-    TEEC_Result ret;
+    bool ret;
 
     struct synap_device *synap_device = data;
 
@@ -462,13 +436,8 @@ static irqreturn_t synap_irq_handler(int irq, void *data)
 
     // read the interrupt value so that the interrupt is cleared on the NPU
     // this is a threaded irq handler so there is no problem to call a blocking function
-    ret = synap_ca_read_interrupt_register(&synap_device->ta->teec_session,
+    ret = synap_ca_read_interrupt_register(synap_device->ta->ca,
                                            &synap_device->irq_status);
-
-    // TEEC_ERROR_BAD_STATE may be raised if the execution was aborted
-    if (ret != TEEC_SUCCESS && ret != TEEC_ERROR_BAD_STATE) {
-        KLOGE("error 0x%08x while reading npu status register", ret);
-    }
 
     KLOGI("interrupt with status 0x%08x", synap_device->irq_status);
 
@@ -549,8 +518,8 @@ static bool do_synap_set_input_data(struct synap_file *inst,
         return false;
     }
 
-    if(synap_ca_set_input(&inst->synap_device->ta->teec_session,
-                            n->ta_nid, b->ta_aid, data->index) != TEEC_SUCCESS) {
+    if(!synap_ca_set_input(inst->synap_device->ta->ca, 
+                           n->ta_nid, b->ta_aid, data->index)) {
         return false;
     }
 
@@ -582,8 +551,8 @@ static bool do_synap_set_output_data(struct synap_file *inst,
         return false;
     }
 
-    if(synap_ca_set_output(&inst->synap_device->ta->teec_session,
-                            n->ta_nid, b->ta_aid, data->index) != TEEC_SUCCESS) {
+    if(!synap_ca_set_output(inst->synap_device->ta->ca,
+                            n->ta_nid, b->ta_aid, data->index)) {
         return false;
     }
 
@@ -660,9 +629,9 @@ static bool do_synap_create_io_buffer(struct synap_file *inst,
 
     KLOGI("registering new buffer (size %d)", data->size);
 
-    if (synap_ca_create_io_buffer_from_sg(&inst->synap_device->ta->teec_session,
-                                  buf->mem->sg_table, 0,
-                                  data->size, false, &buf->ta_bid, &buf->mem_id) != TEEC_SUCCESS) {
+    if (!synap_ca_create_io_buffer_from_sg(inst->synap_device->ta->ca,
+                                           buf->mem->sg_table, 0,
+                                           data->size, false, &buf->ta_bid, &buf->mem_id)) {
         synap_free_io_buffer(buf);
         return false;
     }
@@ -710,9 +679,9 @@ static bool do_synap_create_io_buffer_from_dmabuf(struct synap_file *inst,
 
     KLOGI("registering fd %d (offset %d size %d)", data->fd, data->offset, data->size);
 
-    if (synap_ca_create_io_buffer_from_sg(&inst->synap_device->ta->teec_session,
-                                  buf->mem->sg_table, data->offset,
-                                  data->size, secure, &buf->ta_bid, &buf->mem_id) != TEEC_SUCCESS) {
+    if (!synap_ca_create_io_buffer_from_sg(inst->synap_device->ta->ca,
+                                           buf->mem->sg_table, data->offset,
+                                           data->size, secure, &buf->ta_bid, &buf->mem_id)) {
         synap_free_io_buffer(buf);
         return false;
     }
@@ -747,9 +716,9 @@ static bool do_synap_create_io_buffer_from_mem_id(struct synap_file *inst,
 
     KLOGI("registering mem_id %d (offset %d size %d)", data->mem_id, data->offset, data->size);
 
-    if (synap_ca_create_io_buffer_from_mem_id(&inst->synap_device->ta->teec_session,
-                                              buf->mem_id, data->offset,
-                                              data->size, &buf->ta_bid) != TEEC_SUCCESS) {
+    if (!synap_ca_create_io_buffer_from_mem_id(inst->synap_device->ta->ca,
+                                               buf->mem_id, data->offset,
+                                               data->size, &buf->ta_bid)) {
         synap_free_io_buffer(buf);
         return false;
     }
@@ -801,9 +770,9 @@ static bool do_synap_attach_io_buffer(
 
     KLOGI("attaching bid %d", data->bid);
 
-    if (synap_ca_attach_io_buffer(&inst->synap_device->ta->teec_session,
-                                  network->ta_nid, buffer->ta_bid,
-                                  &attachment->ta_aid) != TEEC_SUCCESS) {
+    if (!synap_ca_attach_io_buffer(inst->synap_device->ta->ca,
+                                   network->ta_nid, buffer->ta_bid,
+                                   &attachment->ta_aid)) {
         synap_free_attachment(attachment);
         return false;
     }
@@ -850,8 +819,7 @@ static bool do_synap_destroy_io_buffer(struct synap_file *inst, u32 bid)
         return false;
     }
 
-    if (synap_ca_destroy_io_buffer(&inst->synap_device->ta->teec_session,
-                                   buf->ta_bid) != TEEC_SUCCESS) {
+    if (!synap_ca_destroy_io_buffer(inst->synap_device->ta->ca, buf->ta_bid)) {
         KLOGE("error while releasing  bidr=%d", bid);
     }
 
@@ -895,7 +863,7 @@ static bool do_synap_detach_io_buffer(struct synap_file *inst, u32 nid, u32 aid)
         net->io_buff_size -= attachment->buffer->mem->size;
     }
 
-    synap_ca_detach_io_buffer(&inst->synap_device->ta->teec_session, net->ta_nid,
+    synap_ca_detach_io_buffer(inst->synap_device->ta->ca, net->ta_nid,
                               attachment->ta_aid);
 
     attachment->buffer->ref_count--;
@@ -974,7 +942,7 @@ static bool synap_get_network_resources_desc(void* model_buffer, size_t model_si
 static bool do_synap_create_network(struct synap_file *inst,
                                            struct synap_create_network_data *data)
 {
-    TEEC_Result ret;
+    bool ret;
     struct synap_network *network = NULL;
     struct synap_network_resources_desc desc;
     uint8_t ebg_header[EBG_FILE_HEADER_SIZE];
@@ -1055,7 +1023,7 @@ static bool do_synap_create_network(struct synap_file *inst,
         return false;
     }
 
-    ret = synap_ca_create_network(&inst->synap_device->ta->teec_session,
+    ret = synap_ca_create_network(inst->synap_device->ta->ca,
             header_mem->sg_table, header_mem->offset, file_header.public_data_length,
             payload_mem->sg_table, payload_mem->offset, payload_mem->size,
             network->code->sg_table,
@@ -1068,7 +1036,7 @@ static bool do_synap_create_network(struct synap_file *inst,
     synap_mem_free(header_mem);
     synap_mem_free(payload_mem);
 
-    if (ret != TEEC_SUCCESS) {
+    if (!ret) {
         KLOGE("create network failed");
         synap_free_network(network);
         return false;
@@ -1111,7 +1079,7 @@ static bool do_synap_start_network(struct synap_file *inst, u32 nid, bool *inter
         return false;
     }
 
-    if (synap_ca_start_network(&inst->synap_device->ta->teec_session, network->ta_nid) != TEEC_SUCCESS) {
+    if (!synap_ca_start_network(inst->synap_device->ta->ca, network->ta_nid)) {
         KLOGE("start network failed");
         return false;
     }
@@ -1122,7 +1090,7 @@ static bool do_synap_start_network(struct synap_file *inst, u32 nid, bool *inter
         jiffies *= 2;
     }
 
-    KLOGI("wait for interrupt\n");
+    KLOGI("wait for interrupt");
 
     // the wait_event_interruptible_timeout automatically makes sure there is a memory barrier
     // that ensures we can read irq_status as written by the irq handler
@@ -1130,12 +1098,12 @@ static bool do_synap_start_network(struct synap_file *inst, u32 nid, bool *inter
                                                     inst->synap_device->irq_status, jiffies);
 
     if (wait_result == 0) {
-        KLOGE("npu timeout\n");
+        KLOGE("npu timeout");
     } else if (wait_result == -ERESTARTSYS) {
-        KLOGI("process interrupted by a signal\n");
+        KLOGI("process interrupted by a signal");
 
         // abort the network execution
-        synap_ca_deactivate_npu(&inst->synap_device->ta->teec_session);
+        synap_ca_deactivate_npu(inst->synap_device->ta->ca);
 
         // wait for any irq handling thread that may have been scheduled
         // before we reset the NPU
@@ -1155,8 +1123,8 @@ static bool do_synap_start_network(struct synap_file *inst, u32 nid, bool *inter
     // in case of error we ensure the NPU is shut down to reset its state
     if (!success && !*interrupted) {
         KLOGE("resetting NPU after error")
-        synap_ca_dump_state(&inst->synap_device->ta->teec_session);
-        synap_ca_deactivate_npu(&inst->synap_device->ta->teec_session);
+        synap_ca_dump_state(inst->synap_device->ta->ca);
+        synap_ca_deactivate_npu(inst->synap_device->ta->ca);
     }
 
     inst->synap_device->irq_status = 0;
@@ -1207,7 +1175,7 @@ static bool do_synap_destroy_network(struct synap_file *inst, u32 nid)
         do_synap_detach_io_buffer(inst, network->nidr, aid);
     }
 
-    synap_ca_destroy_network(&inst->synap_device->ta->teec_session, network->ta_nid);
+    synap_ca_destroy_network(inst->synap_device->ta->ca, network->ta_nid);
 
     synap_free_network(network);
 
@@ -1430,7 +1398,7 @@ static int32_t synap_drv_release(struct inode * inode, struct file * file)
     list_del(&inst->list);
 
     if (list_empty(&inst->synap_device->files)) {
-        synap_ca_deactivate_npu(&inst->synap_device->ta->teec_session);
+        synap_ca_deactivate_npu(inst->synap_device->ta->ca);
         synap_power_off(inst->synap_device->pdev);
     }
 
@@ -1475,13 +1443,13 @@ static int32_t synap_power_on(struct platform_device *pdev)
     LOG_ENTER();
 
     if (NULL == pdev) {
-        KLOGH("platform device is NULL \n");
+        KLOGH("platform device is NULL");
         return -1;
     }
 
     coreclk = devm_clk_get(dev, "core");
     if (IS_ERR(coreclk)) {
-        KLOGH("devm_clk_get failed, clk=%p!\n", coreclk);
+        KLOGH("devm_clk_get failed, clk=%p!", coreclk);
         return -1;
     }
     else {
@@ -1490,7 +1458,7 @@ static int32_t synap_power_on(struct platform_device *pdev)
 
     sysclk = devm_clk_get(dev, "sys");
     if (IS_ERR(sysclk)) {
-        KLOGH("devm_clk_get failed, clk=%p!\n", sysclk);
+        KLOGH("devm_clk_get failed, clk=%p!", sysclk);
         return -1;
     }
     else {
@@ -1510,7 +1478,7 @@ static int32_t synap_power_off(struct platform_device *pdev)
     LOG_ENTER();
 
     if (NULL == pdev) {
-        KLOGH("platform device is NULL \n");
+        KLOGH("platform device is NULL");
         return -1;
     }
 
@@ -1596,14 +1564,14 @@ static int32_t synap_platform_probe(struct platform_device *pdev)
         return -1;
     }
 
-    KLOGH("irq line from dts = %d\n", synap_device->irq_line);
+    KLOGH("irq line from dts = %d", synap_device->irq_line);
 
     /* setup the TA */
 
     synap_device->ta = synap_init_ta(synap_device);
 
     if (!synap_device->ta) {
-        KLOGE("failed to init synap ta\n");
+        KLOGE("failed to init synap ta");
         synap_platform_remove(pdev);
         return -1;
     }
@@ -1629,7 +1597,7 @@ static int32_t synap_platform_probe(struct platform_device *pdev)
 
     synap_device->irq_registered = 1;
 
-    KLOGI("enabled ISR for interrupt line=%d\n", synap_device->irq_line);
+    KLOGI("enabled ISR for interrupt line=%d", synap_device->irq_line);
 
     /* register a character device to control this device */
 
@@ -1675,8 +1643,8 @@ static int32_t synap_platform_suspend(struct platform_device *pdev,
 
     mutex_lock(&synap_device->hw_mutex);
 
-    if ((ret = synap_ca_deactivate_npu(&synap_device->ta->teec_session)) != TEEC_SUCCESS) {
-        KLOGE("TEE npu deactivation failed. ret=0x%08x\n", ret);
+    if (!synap_ca_deactivate_npu(synap_device->ta->ca)) {
+        KLOGE("TEE npu deactivation failed. ret=0x%08x", ret);
         mutex_unlock(&synap_device->hw_mutex);
         mutex_unlock(&synap_device->files_mutex);
         return -EFAULT;
